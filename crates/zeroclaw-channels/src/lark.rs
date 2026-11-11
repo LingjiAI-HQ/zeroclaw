@@ -473,6 +473,18 @@ struct CachedTenantToken {
     refresh_after: Instant,
 }
 
+// LKE-CUSTOM(LKE-002): cached contact-API lookup result for a sender open_id.
+// `name: None` is a negative cache entry (lookup failed or no name) — still
+// cached briefly so inbound traffic cannot hammer the API on a scope-less app.
+struct CachedSenderName {
+    name: Option<String>,
+    expires_at: Instant,
+}
+
+const SENDER_NAME_POSITIVE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const SENDER_NAME_NEGATIVE_TTL: Duration = Duration::from_secs(10 * 60);
+const SENDER_NAME_CACHE_MAX: usize = 1024;
+
 fn extract_lark_response_code(body: &serde_json::Value) -> Option<i64> {
     body.get("code").and_then(|c| c.as_i64())
 }
@@ -771,6 +783,14 @@ pub struct LarkChannel {
     /// via [`Self::with_streaming`].
     draft_update_interval_ms: u64,
     last_draft_edit: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
+    /// LKE-CUSTOM(LKE-002): best-effort sender display-name cache (open_id →
+    /// contact-API result) powering `ChannelMessage::sender_profile`.
+    sender_names: Arc<tokio::sync::RwLock<HashMap<String, CachedSenderName>>>,
+    /// LKE-CUSTOM(LKE-002): master switch for the contact-API lookup.
+    /// Production default on; the in-file test harness disables it so parse
+    /// tests stay network-free (dedicated profile tests re-enable it with a
+    /// seeded cache).
+    sender_profile_lookup: bool,
     #[cfg(test)]
     api_base_override: Option<String>,
 }
@@ -1151,6 +1171,8 @@ impl LarkChannel {
             stream_mode: StreamMode::Off,
             draft_update_interval_ms: 1000,
             last_draft_edit: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            sender_names: Arc::new(RwLock::new(HashMap::new())),
+            sender_profile_lookup: true,
             #[cfg(test)]
             api_base_override: None,
         }
@@ -1202,6 +1224,13 @@ impl LarkChannel {
 
     pub fn with_ack_reactions(mut self, enabled: bool) -> Self {
         self.ack_reactions = enabled;
+        self
+    }
+
+    /// LKE-CUSTOM(LKE-002): toggle the contact-API sender-name lookup.
+    /// Test harness disables it; production keeps the best-effort default.
+    pub fn with_sender_profile_lookup(mut self, enabled: bool) -> Self {
+        self.sender_profile_lookup = enabled;
         self
     }
 
@@ -1752,6 +1781,12 @@ impl LarkChannel {
                         sender: self
                             .resolve_sender(&lark_msg.chat_id, Some(sender_open_id))
                             .to_string(),
+                        // LKE-CUSTOM(LKE-002): immutable sender id + best-effort
+                        // display-name profile so the agent sees the customer's
+                        // real name, not a bare open_id.
+                        platform_sender_id: (!sender_open_id.is_empty())
+                            .then(|| sender_open_id.to_string()),
+                        sender_profile: self.resolve_sender_profile(sender_open_id).await,
                         reply_target: lark_msg.chat_id.clone(),
                         content: text,
                         channel: self.channel_name().to_string(),
@@ -2125,6 +2160,127 @@ impl LarkChannel {
         ))
     }
 
+    // LKE-CUSTOM(LKE-002): resolve the human display name of an inbound
+    // sender via the contact API, best-effort. Feishu DMs identify senders by
+    // a bare open_id; without this the agent turn never sees a real name.
+    // Falls back to an empty profile (upstream behavior) on any failure —
+    // inbound delivery must not depend on this lookup.
+    async fn fetch_sender_name_with_token(
+        &self,
+        token: &str,
+        open_id: &str,
+    ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
+        let url = format!(
+            "{}/contact/v3/users/{}?user_id_type=open_id",
+            self.api_base(),
+            open_id
+        );
+        let resp = self
+            .http_client()
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await?;
+        let status = resp.status();
+        let body = resp
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_or_else(|_| serde_json::json!({}));
+        Ok((status, body))
+    }
+
+    async fn resolve_sender_profile(&self, open_id: &str) -> zeroclaw_api::channel::SenderProfile {
+        let mut profile = zeroclaw_api::channel::SenderProfile::default();
+        if !self.sender_profile_lookup {
+            return profile;
+        }
+        let open_id = open_id.trim();
+        if open_id.is_empty() {
+            return profile;
+        }
+        {
+            let cache = self.sender_names.read().await;
+            if let Some(cached) = cache.get(open_id)
+                && cached.expires_at > Instant::now()
+            {
+                profile.display_name = cached.name.clone();
+                return profile;
+            }
+        }
+        let fetched = async {
+            let token = self.get_tenant_access_token().await?;
+            let (status, body) = self.fetch_sender_name_with_token(&token, open_id).await?;
+            if should_refresh_lark_tenant_token(status, &body) {
+                self.invalidate_token().await;
+                let refreshed = self.get_tenant_access_token().await?;
+                return self.fetch_sender_name_with_token(&refreshed, open_id).await;
+            }
+            Ok::<_, anyhow::Error>((status, body))
+        };
+        let lookup = tokio::time::timeout(Duration::from_secs(3), fetched).await;
+        let name = match lookup {
+            Ok(Ok((status, body))) if status.is_success() => body
+                .pointer("/data/user/name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            Ok(Ok((status, body))) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "status": status.as_u16(),
+                            "code": extract_lark_response_code(&body),
+                        })),
+                    "lark: sender name lookup failed (soft)"
+                );
+                None
+            }
+            Ok(Err(e)) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "error_key": "lark.sender_name_lookup.failed",
+                            "error": format!("{e}"),
+                        })),
+                    "lark: sender name lookup errored (soft)"
+                );
+                None
+            }
+            Err(_) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "error_key": "lark.sender_name_lookup.timeout",
+                        })),
+                    "lark: sender name lookup timed out (soft)"
+                );
+                None
+            }
+        };
+        let mut cache = self.sender_names.write().await;
+        if cache.len() >= SENDER_NAME_CACHE_MAX && !cache.contains_key(open_id) {
+            cache.clear();
+        }
+        cache.insert(
+            open_id.to_string(),
+            CachedSenderName {
+                expires_at: Instant::now()
+                    + if name.is_some() {
+                        SENDER_NAME_POSITIVE_TTL
+                    } else {
+                        SENDER_NAME_NEGATIVE_TTL
+                    },
+                name: name.clone(),
+            },
+        );
+        profile.display_name = name;
+        profile
+    }
+
     async fn fetch_bot_open_id_with_token(
         &self,
         token: &str,
@@ -2431,6 +2587,11 @@ impl LarkChannel {
         vec![ChannelMessage {
             id: message_id.to_string(),
             sender: self.resolve_sender(chat_id, Some(open_id)).to_string(),
+            // LKE-CUSTOM(LKE-002): immutable sender id + best-effort
+            // display-name profile so the agent sees the customer's
+            // real name, not a bare open_id.
+            platform_sender_id: (!open_id.is_empty()).then(|| open_id.to_string()),
+            sender_profile: self.resolve_sender_profile(open_id).await,
             reply_target: chat_id.to_string(),
             content: text,
             channel: self.channel_name().to_string(),
@@ -2851,6 +3012,11 @@ impl LarkChannel {
         messages.push(ChannelMessage {
             id: evt_message_id.to_string(),
             sender: self.resolve_sender(chat_id, Some(open_id)).to_string(),
+            // LKE-CUSTOM(LKE-002): immutable sender id + best-effort
+            // display-name profile so the agent sees the customer's
+            // real name, not a bare open_id.
+            platform_sender_id: (!open_id.is_empty()).then(|| open_id.to_string()),
+            sender_profile: self.resolve_sender_profile(open_id).await,
             reply_target: chat_id.to_string(),
             content: text,
             channel: self.channel_name().to_string(),
@@ -4323,7 +4489,10 @@ mod tests {
                 "lark_test_alias",
                 resolver_from(peers),
                 true,
-            ),
+            )
+            // LKE-CUSTOM(LKE-002): keep parse tests network-free; dedicated
+            // profile tests re-enable the lookup with a seeded cache.
+            .with_sender_profile_lookup(false),
             "ou_bot",
         )
     }
@@ -5975,6 +6144,62 @@ mod tests {
         let msgs = ch.parse_event_payload_async(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "Hello async!");
+    }
+
+    // LKE-CUSTOM(LKE-002): sender identity plumbing — a cached contact-API
+    // result reaches the ChannelMessage; the shared harness keeps the lookup
+    // off so these tests never touch the network.
+    async fn seed_sender_name(ch: &LarkChannel, open_id: &str, name: Option<&str>) {
+        ch.sender_names.write().await.insert(
+            open_id.to_string(),
+            CachedSenderName {
+                name: name.map(str::to_string),
+                expires_at: Instant::now() + SENDER_NAME_POSITIVE_TTL,
+            },
+        );
+    }
+
+    fn p2p_text_payload() -> serde_json::Value {
+        serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_testuser123" } },
+                "message": {
+                    "message_id": "om_text123",
+                    "message_type": "text",
+                    "content": "{\"text\":\"你好\"}",
+                    "chat_id": "oc_chat123",
+                    "chat_type": "p2p",
+                    "create_time": "1699999999000"
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn lark_sender_profile_positive_cache_carries_display_name() {
+        let ch = make_channel().with_sender_profile_lookup(true);
+        seed_sender_name(&ch, "ou_testuser123", Some("张三")).await;
+        let msgs = ch.parse_event_payload_async(&p2p_text_payload()).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].sender_profile.display_name.as_deref(), Some("张三"));
+        assert_eq!(
+            msgs[0].platform_sender_id.as_deref(),
+            Some("ou_testuser123")
+        );
+    }
+
+    #[tokio::test]
+    async fn lark_sender_profile_negative_cache_leaves_profile_empty() {
+        let ch = make_channel().with_sender_profile_lookup(true);
+        seed_sender_name(&ch, "ou_testuser123", None).await;
+        let msgs = ch.parse_event_payload_async(&p2p_text_payload()).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].sender_profile.display_name, None);
+        assert_eq!(
+            msgs[0].platform_sender_id.as_deref(),
+            Some("ou_testuser123")
+        );
     }
 
     #[tokio::test]

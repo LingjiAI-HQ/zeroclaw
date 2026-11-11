@@ -2418,6 +2418,34 @@ fn build_channel_turn_context_preamble(
     let sender = msg.sender.as_str();
     let message_id = msg.id.as_str();
 
+    // LKE-CUSTOM(LKE-002): channel-resolved customer identity — the display
+    // name (and future extensible attributes) ride alongside the raw platform
+    // id so the agent can address the customer by their real name.
+    let sender_name = msg
+        .sender_profile
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut sender_identity = format!("sender={sender}");
+    let mut name_guidance = String::new();
+    if let Some(name) = sender_name {
+        sender_identity.push_str(&format!(" sender_name={name}"));
+        name_guidance.push_str(
+            " The sender_name field is the sender's human-readable display \
+             name; prefer it over the raw platform id when addressing or \
+             referring to this customer.",
+        );
+    }
+    if !msg.sender_profile.extra.is_empty() {
+        let meta = serde_json::to_string(&msg.sender_profile.extra).unwrap_or_default();
+        sender_identity.push_str(&format!(" sender_meta={meta}"));
+        name_guidance.push_str(
+            " The sender_meta field carries additional customer attributes \
+             resolved by the channel.",
+        );
+    }
+
     // Webhook contract: downstream services expect the *sender* as the
     // recipient and the thread/conversation identifier in `thread_id`.
     // Reusing `reply_target` as `to` for webhook would strip the thread
@@ -2436,22 +2464,23 @@ fn build_channel_turn_context_preamble(
 
     let mut preamble = format!(
         "[turn-context] time={time} date={date} weekday={weekday} tz={tz} \
-         channel={channel} reply_target={reply_target} sender={sender} \
-         message_id={message_id}. The sender field is the platform-specific \
-         user ID of the person who sent this message. Use it to distinguish \
-         between different users. The message_id field identifies this \
-         incoming message; pass it as the `message_id` argument when calling \
-         the `reaction` tool. When scheduling delayed messages or reminders \
-         via cron_add for this conversation, use {delivery_hint} so the \
-         message reaches the user.\n\n",
+         channel={channel} reply_target={reply_target} {sender_identity} \
+         message_id={message_id}.{name_guidance} The sender field is the \
+         platform-specific user ID of the person who sent this message. Use \
+         it to distinguish between different users. The message_id field \
+         identifies this incoming message; pass it as the `message_id` \
+         argument when calling the `reaction` tool. When scheduling delayed \
+         messages or reminders via cron_add for this conversation, use \
+         {delivery_hint} so the message reaches the user.\n\n",
         time = now.format("%H:%M:%S"),
         date = now.format("%Y-%m-%d"),
         weekday = now.format("%A"),
         tz = now.format("%Z"),
         channel = channel_name,
         reply_target = reply_target,
-        sender = sender,
+        sender_identity = sender_identity,
         message_id = message_id,
+        name_guidance = name_guidance,
         delivery_hint = delivery_hint,
     );
 
@@ -48106,6 +48135,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 id: "msg-image-1".to_string(),
                 sender: "alice".to_string(),
                 platform_sender_id: None,
+                sender_profile: Default::default(),
                 reply_target: "chat-image".to_string(),
                 content: "please inspect this".to_string(),
                 channel: "test-channel".into(),
@@ -51803,6 +51833,7 @@ This is an example JSON object for profile settings."#;
                 id: "msg-image-route".to_string(),
                 sender: "alice".to_string(),
                 platform_sender_id: None,
+                sender_profile: Default::default(),
                 reply_target: "chat-image-route".to_string(),
                 content: "please inspect this".to_string(),
                 channel: "test-channel".into(),
@@ -57347,6 +57378,53 @@ Done."#;
             !preamble.contains("\"thread_id\""),
             "non-webhook preamble must not emit thread_id: {preamble}"
         );
+    }
+
+    // LKE-CUSTOM(LKE-002): channel-resolved customer identity renders into the
+    // turn context; without a profile the preamble stays byte-identical to
+    // upstream (no sender_name / sender_meta segments).
+    #[test]
+    fn channel_turn_context_renders_sender_profile() {
+        let mut profile = zeroclaw_api::channel::SenderProfile::default();
+        profile.display_name = Some("张三".into());
+        profile.extra.insert("tier".into(), "vip".into());
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            channel: "lark".into(),
+            reply_target: "oc_chat123".into(),
+            sender: "ou_testuser123".into(),
+            sender_profile: profile,
+            ..Default::default()
+        };
+        let preamble = build_channel_turn_context_preamble(&msg, None);
+        assert!(
+            preamble.contains("sender=ou_testuser123 sender_name=张三"),
+            "sender_name must follow the raw platform id: {preamble}"
+        );
+        assert!(
+            preamble.contains("sender_meta={\"tier\":\"vip\"}"),
+            "extensible customer attributes must render as sender_meta: {preamble}"
+        );
+        assert!(
+            preamble.contains("prefer it over the raw platform id"),
+            "guidance must tell the agent to use the display name: {preamble}"
+        );
+    }
+
+    #[test]
+    fn channel_turn_context_without_sender_profile_matches_upstream_shape() {
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            channel: "lark".into(),
+            reply_target: "oc_chat123".into(),
+            sender: "ou_testuser123".into(),
+            ..Default::default()
+        };
+        let preamble = build_channel_turn_context_preamble(&msg, None);
+        assert!(
+            preamble.contains("sender=ou_testuser123 message_id="),
+            "no profile must leave the identity segment exactly as upstream: {preamble}"
+        );
+        assert!(!preamble.contains("sender_name"));
+        assert!(!preamble.contains("sender_meta"));
     }
 
     #[test]

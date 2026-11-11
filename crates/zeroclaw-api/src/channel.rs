@@ -390,6 +390,24 @@ pub enum ChannelConversationScope {
     ReplyTarget,
 }
 
+/// Extensible customer/sender identity attached to an inbound channel message.
+///
+/// Populated best-effort by adapters that can resolve more than the raw
+/// platform ID (e.g. Lark resolves the display name via the contact API).
+/// `Default` is empty, so channels without a resolution path and existing
+/// construction sites (`..Default::default()`) are unaffected. Future
+/// customer attributes (avatar, locale, tier, ...) go into `extra` without
+/// further struct changes.
+// LKE-CUSTOM(LKE-002): registry entry in docs/lke/REGISTRY.md.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SenderProfile {
+    /// Human-readable display name of the sender, when the channel resolved one.
+    pub display_name: Option<String>,
+    /// Additional customer facts as string key/value pairs, rendered into the
+    /// agent's turn context verbatim. Reserved for future extensions.
+    pub extra: std::collections::BTreeMap<String, String>,
+}
+
 /// A message received from or sent to a channel
 #[derive(Debug, Clone, Default)]
 pub struct ChannelMessage {
@@ -447,6 +465,10 @@ pub struct ChannelMessage {
     /// from message text, a reply parent, or room state. `false` means text
     /// or unknown.
     pub voice_origin: bool,
+    /// LKE-CUSTOM(LKE-002): extensible sender identity (display name and
+    /// future customer attributes) resolved best-effort by the channel.
+    /// Empty by default — existing channels are unaffected.
+    pub sender_profile: SenderProfile,
 }
 
 /// Message to send through a channel
