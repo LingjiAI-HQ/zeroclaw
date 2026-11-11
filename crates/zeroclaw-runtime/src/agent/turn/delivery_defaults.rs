@@ -50,6 +50,45 @@ pub(crate) fn maybe_inject_originating_channel(
     }
 }
 
+// LKE-CUSTOM(LKE-001): default the interactive tools' empty `recipient` to the
+/// turn's reply target — upstream send sites hardcode `""` and chat channels
+/// reject the delivery. Registry: docs/lke/REGISTRY.md.
+/// Interactive back-channel tools that take an optional `recipient` arg and
+/// otherwise send to an empty peer (the v0.8.7 send sites hardcode `""`).
+const ORIGINATING_RECIPIENT_TOOLS: &[&str] = &["ask_user", "poll", "escalate_to_human"];
+
+/// When `tool_args` omits `recipient`, fill it from the turn's reply target so
+/// interactive prompts and escalations reach the conversation that issued the
+/// turn instead of an empty peer the channel adapter rejects.
+pub(crate) fn maybe_inject_originating_recipient(
+    tool_name: &str,
+    tool_args: &mut serde_json::Value,
+    channel_reply_target: Option<&str>,
+) {
+    if !ORIGINATING_RECIPIENT_TOOLS.contains(&tool_name) {
+        return;
+    }
+    let Some(reply_target) = channel_reply_target
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let Some(args) = tool_args.as_object_mut() else {
+        return;
+    };
+    let needs_recipient = args
+        .get("recipient")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|value| value.trim().is_empty());
+    if needs_recipient {
+        args.insert(
+            "recipient".to_string(),
+            serde_json::Value::String(reply_target.to_string()),
+        );
+    }
+}
+
 pub(crate) fn maybe_inject_channel_delivery_defaults(
     tool_name: &str,
     tool_args: &mut serde_json::Value,
@@ -59,6 +98,12 @@ pub(crate) fn maybe_inject_channel_delivery_defaults(
 ) {
     // Interactive tools first — independent of cron delivery defaults.
     maybe_inject_originating_channel(tool_name, tool_args, channel_name);
+    // They deliver through the channel map's generic send, which carries an
+    // explicit recipient; without one they target an empty peer and chat-based
+    // channels reject the delivery (telegram "chat_id is empty", lark
+    // "invalid receive_id"). Seed the turn's reply target the same way cron_add
+    // delivery is seeded — an explicit recipient is never overridden.
+    maybe_inject_originating_recipient(tool_name, tool_args, channel_reply_target);
 
     if tool_name != "cron_add" {
         return;
@@ -365,6 +410,50 @@ mod tests {
             maybe_inject_originating_channel(tool, &mut args, "acp");
             assert_eq!(args["channel"], "acp", "tool={tool}");
         }
+    }
+
+    #[test]
+    fn interactive_tools_get_reply_target_as_recipient() {
+        // Regression: ask_user/escalate_to_human sent with a hardcoded empty
+        // recipient, so chat-based channels rejected the delivery (telegram
+        // "chat_id is empty", lark "invalid receive_id").
+        for tool in ["ask_user", "escalate_to_human", "poll"] {
+            let mut args = serde_json::json!({ "summary": "s" });
+            maybe_inject_channel_delivery_defaults(
+                tool,
+                &mut args,
+                "telegram",
+                Some("default"),
+                Some("-5168135865"),
+            );
+            assert_eq!(args["recipient"], "-5168135865", "tool={tool}");
+        }
+    }
+
+    #[test]
+    fn explicit_recipient_is_never_overridden() {
+        let mut args = serde_json::json!({ "summary": "s", "recipient": "7935477110" });
+        maybe_inject_channel_delivery_defaults(
+            "escalate_to_human",
+            &mut args,
+            "telegram",
+            Some("default"),
+            Some("-5168135865"),
+        );
+        assert_eq!(args["recipient"], "7935477110");
+    }
+
+    #[test]
+    fn empty_reply_target_leaves_recipient_unset() {
+        let mut args = serde_json::json!({ "summary": "s" });
+        maybe_inject_channel_delivery_defaults(
+            "escalate_to_human",
+            &mut args,
+            "rpc",
+            None,
+            Some("   "),
+        );
+        assert!(args.get("recipient").is_none());
     }
 
     #[test]

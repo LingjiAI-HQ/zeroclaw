@@ -164,6 +164,11 @@ impl Tool for EscalateToHumanTool {
                 "channel": {
                     "type": "string",
                     "description": "Channel to escalate on. Defaults to the channel this conversation is happening on."
+                },
+                // LKE-CUSTOM(LKE-001): explicit recipient arg, honored below.
+                "recipient": {
+                    "type": "string",
+                    "description": "Recipient/chat identifier within the channel (e.g., chat_id for Telegram). Defaults to this conversation's reply target."
                 }
             },
             "required": ["summary"]
@@ -242,6 +247,13 @@ impl Tool for EscalateToHumanTool {
             .and_then(|v| v.as_str())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+
+        let recipient = args
+            .get("recipient")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default();
 
         // Resolve channel — block-scoped to drop the RwLock guard before any .await
         let (channel_name, channel): (String, Arc<dyn Channel>) = {
@@ -370,7 +382,7 @@ impl Tool for EscalateToHumanTool {
         }
 
         // Send the escalation message
-        let msg = SendMessage::new(&text, "");
+        let msg = SendMessage::new(&text, recipient.as_str());
         if let Err(e) = channel.send(&msg).await {
             return Ok(ToolResult {
                 success: false,
