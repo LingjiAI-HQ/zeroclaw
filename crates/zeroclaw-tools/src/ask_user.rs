@@ -281,7 +281,11 @@ impl Tool for AskUserTool {
         match response {
             Ok(Some(msg)) => Ok(ToolResult {
                 success: true,
-                output: msg.content.into(),
+                // LKE-CUSTOM(LKE-003): mark the captured reply so the desktop
+                // transcript can surface it as an operator bubble instead of a
+                // swallowed tool row. Marker contract: docs/lke/REGISTRY.md
+                // LKE-003 (same marker as escalate_to_human).
+                output: format!("[HUMAN REPLY|channel={channel_name}] {}", msg.content).into(),
                 error: None,
             }),
             Ok(None) => Ok(ToolResult {
@@ -567,7 +571,9 @@ mod tests {
             .await
             .unwrap();
         assert!(result.success, "error: {:?}", result.error);
-        assert_eq!(result.output, "Yes, proceed!");
+        // LKE-CUSTOM(LKE-003): captured replies carry the human-reply marker
+        // (docs/lke/REGISTRY.md LKE-003), same contract as escalate_to_human.
+        assert_eq!(result.output, "[HUMAN REPLY|channel=test] Yes, proceed!");
         assert!(result.error.is_none());
     }
 
@@ -587,7 +593,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result.success, "error: {:?}", result.error);
-        assert_eq!(result.output, "2");
+        assert_eq!(result.output, "[HUMAN REPLY|channel=telegram] 2");
     }
 
     #[tokio::test]
@@ -614,7 +620,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result.success);
-        assert_eq!(result.output, "ok");
+        assert_eq!(result.output, "[HUMAN REPLY|channel=cli] ok");
     }
 
     /// ACP/RPC-shaped channel: structured `request_choice` returns `Ok(None)`

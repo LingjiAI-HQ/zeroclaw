@@ -414,7 +414,12 @@ impl Tool for EscalateToHumanTool {
             match response {
                 Ok(Some(msg)) => Ok(ToolResult {
                     success: true,
-                    output: msg.content.into(),
+                    // LKE-CUSTOM(LKE-003): mark the captured human reply so the
+                    // desktop transcript can surface it as an operator bubble
+                    // instead of a swallowed tool row (the wait loop otherwise
+                    // consumes the message without writing it to the session
+                    // history). Marker contract: docs/lke/REGISTRY.md LKE-003.
+                    output: format!("[HUMAN REPLY|channel={channel_name}] {}", msg.content).into(),
                     error: None,
                 }),
                 Ok(None) => Ok(ToolResult {
@@ -731,7 +736,37 @@ mod tests {
             .unwrap();
 
         assert!(result.success, "error: {:?}", result.error);
-        assert_eq!(result.output, "Approved, go ahead");
+        // LKE-CUSTOM(LKE-003): the captured reply carries the human-reply
+        // marker so the desktop transcript can render it as an operator
+        // bubble (docs/lke/REGISTRY.md LKE-003).
+        assert_eq!(
+            result.output,
+            "[HUMAN REPLY|channel=test] Approved, go ahead"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_blocking_mode_marks_human_reply_with_channel() {
+        let tool = make_tool_with_channels(vec![(
+            "lark",
+            Arc::new(RespondingChannel::new("lark", "已收到，配节走起")) as Arc<dyn Channel>,
+        )]);
+
+        let result = tool
+            .execute(json!({
+                "summary": "Need help",
+                "wait_for_response": true,
+                "timeout_secs": 5
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        let out = result.output.as_str();
+        assert!(
+            out.starts_with("[HUMAN REPLY|channel=lark] 已收到"),
+            "marker must lead the reply: {out}"
+        );
     }
 
     // ── 9. test_blocking_mode_timeout ──

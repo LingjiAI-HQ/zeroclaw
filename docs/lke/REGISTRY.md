@@ -8,5 +8,6 @@
 |----|------|------|----------|----------|----------|
 | LKE-001 | 在库 | 人工发送消息修复：`escalate_to_human`/`ask_user`/`poll` 的 `recipient` 在 v0.8.7 发送点硬编码空串，聊天型渠道拒收（telegram "chat_id is empty"、lark "invalid receive_id"），转人工提示无法送达 | 上游未修；补丁曾存档于桌面仓 `docs/zero-engine/patches/v0.8.7-interactive-tools-recipient.patch`（PR 素材） | `crates/zeroclaw-runtime/src/agent/turn/delivery_defaults.rs`、`crates/zeroclaw-tools/src/ask_user.rs`、`crates/zeroclaw-tools/src/escalate.rs` | 低：纯增量（注入函数 + schema 参数 + 透传），不改既有行为；上游若修复即转"上游化" |
 | LKE-002 | 在库 | 渠道传递客户真实名：飞书 DM 的 `sender` 是裸 `open_id`，agent 看不到客户姓名；新增可扩展的 `SenderProfile`（`display_name` + `extra` KV），lark 经 contact API 尽力解析并注入 turn-context，为后续传递更多客户信息留通道 | 无上游对应需求 | `crates/zeroclaw-api/src/channel.rs`、`crates/zeroclaw-channels/src/lark.rs`、`crates/zeroclaw-channels/src/orchestrator/mod.rs` | 中：lark 入站构造点与 orchestrator turn-context 前言随上游演进可能漂移，合并时按标记重表达 |
+| LKE-003 | 在库 | 人工回复可见性：escalate/ask_user 的 wait_for_response 在工具内新开监听把人工回复截为 tool result——不写会话历史、桌面转录把 tool 行丢弃，人工回复完全不可见；wait 命中改为输出带 `[HUMAN REPLY\|channel=<map-key>] ` 前缀（文本标记协议，不依赖结构化 data 落库），桌面归一层识别该标记渲染为人工气泡（不写 user 行——客户记忆提取不被人工发言污染，拍板 2026-11-12） | 无上游对应需求 | `crates/zeroclaw-tools/src/escalate.rs`、`crates/zeroclaw-tools/src/ask_user.rs`；桌面侧消费在 lingkeai-desktop sessionHistory | 低：两处 wait 分支输出行 + 测试断言，纯文本前缀协议 |
 
 > 新增定制先加行再动代码；上游合并轮按本表逐项核对存活状态。
