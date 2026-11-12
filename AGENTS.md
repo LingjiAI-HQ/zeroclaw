@@ -61,6 +61,16 @@ cargo test
 
 Use `./dev/ci.sh all` for full pre-PR validation when the scope warrants it. Docs-only changes use `scripts/ci/docs_quality_gate.sh` and `scripts/ci/docs_links_gate.sh`. Bootstrap script changes add `bash -n install.sh`.
 
+## LKE Custom Release Build (LingkeAI fork)
+
+This fork carries LingkeAI customizations on `lke/main` (registry: `docs/lke/REGISTRY.md`; rules: `docs/lke/CUSTOMIZING.md`). To build the custom engine release, run the script — do not hand-assemble cargo flags:
+
+```bash
+./scripts/build-lke-release.sh --tag vX.Y.Z-lke.N [--desktop-repo ../lingkeai-desktop] [--skip-tests]
+```
+
+It builds the three release binaries with official-parity parameters (xtask `features --selection dist` + pinned toolchain + `--locked`), runs the verification gates (rustfmt, LKE-CUSTOM marker presence, targeted regression tests over every customization point, `--version` smoke), stamps the tag, and optionally packages the desktop embedded seed (`--desktop-repo`). Logs tee to `target/lke-logs/`. Any gate failure exits non-zero — fix the root cause, do not bypass.
+
 ## Task References
 
 The architecture map routes task-specific documentation. Consult `docs/book/src/contributing/agent-guidelines.md` only for detailed agent examples, risk and stability policy, skill discovery, and protected operational documents. Do not skip a required contract because it is no longer embedded in this bootstrap file.
